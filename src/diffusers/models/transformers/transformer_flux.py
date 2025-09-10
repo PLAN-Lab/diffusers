@@ -82,13 +82,26 @@ class FluxAttnProcessor:
         self,
         attn: "FluxAttention",
         hidden_states: torch.Tensor,
+        other_hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
-            attn, hidden_states, encoder_hidden_states
-        )
+        
+        if other_hidden_states is not None:
+            query, _, _, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
+
+            _, key, value, _, _, _ = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
+        else:
+            query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
+
+            
 
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
@@ -176,6 +189,7 @@ class FluxIPAdapterAttnProcessor(torch.nn.Module):
         self,
         attn: "FluxAttention",
         hidden_states: torch.Tensor,
+        other_hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
@@ -184,9 +198,19 @@ class FluxIPAdapterAttnProcessor(torch.nn.Module):
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
 
-        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
-            attn, hidden_states, encoder_hidden_states
-        )
+
+        if other_hidden_states is not None:
+            query, _, _, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
+
+            _, key, value, _, _, _ = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
+        else:
+            query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
 
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
@@ -326,6 +350,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        other_hidden_states: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
@@ -339,7 +364,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 f"joint_attention_kwargs {unused_kwargs} are not expected by {self.processor.__class__.__name__} and will be ignored."
             )
         kwargs = {k: w for k, w in kwargs.items() if k in attn_parameters}
-        return self.processor(self, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kwargs)
+        return self.processor(self, hidden_states, other_hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kwargs)
 
 
 @maybe_allow_in_graph
@@ -367,8 +392,9 @@ class FluxSingleTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        temb: torch.Tensor,
+        other_hidden_states: Optional[torch.Tensor]=None,
+        encoder_hidden_states: Optional[torch.Tensor]=None,
+        temb: Optional[torch.Tensor]=None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -381,6 +407,7 @@ class FluxSingleTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
+            other_hidden_states=other_hidden_states if other_hidden_states is not None else None,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
@@ -427,6 +454,7 @@ class FluxTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        other_hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -442,6 +470,7 @@ class FluxTransformerBlock(nn.Module):
         # Attention.
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
+            other_hidden_states=other_hidden_states if other_hidden_states is not None else None,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -521,36 +550,6 @@ class FluxTransformer2DModel(
     CacheMixin,
     AttentionMixin,
 ):
-    """
-    The Transformer model introduced in Flux.
-
-    Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
-
-    Args:
-        patch_size (`int`, defaults to `1`):
-            Patch size to turn the input data into small patches.
-        in_channels (`int`, defaults to `64`):
-            The number of channels in the input.
-        out_channels (`int`, *optional*, defaults to `None`):
-            The number of channels in the output. If not specified, it defaults to `in_channels`.
-        num_layers (`int`, defaults to `19`):
-            The number of layers of dual stream DiT blocks to use.
-        num_single_layers (`int`, defaults to `38`):
-            The number of layers of single stream DiT blocks to use.
-        attention_head_dim (`int`, defaults to `128`):
-            The number of dimensions to use for each attention head.
-        num_attention_heads (`int`, defaults to `24`):
-            The number of attention heads to use.
-        joint_attention_dim (`int`, defaults to `4096`):
-            The number of dimensions to use for the joint attention (embedding/channel dimension of
-            `encoder_hidden_states`).
-        pooled_projection_dim (`int`, defaults to `768`):
-            The number of dimensions to use for the pooled projection.
-        guidance_embeds (`bool`, defaults to `False`):
-            Whether to use guidance embeddings for guidance-distilled variant of the model.
-        axes_dims_rope (`Tuple[int]`, defaults to `(16, 56, 56)`):
-            The dimensions to use for the rotary positional embeddings.
-    """
 
     _supports_gradient_checkpointing = True
     _no_split_modules = ["FluxTransformerBlock", "FluxSingleTransformerBlock"]
@@ -571,10 +570,12 @@ class FluxTransformer2DModel(
         pooled_projection_dim: int = 768,
         guidance_embeds: bool = False,
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+        use_2nd_guider: bool = True
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.use_2nd_guider = use_2nd_guider
 
         self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
 
@@ -599,6 +600,23 @@ class FluxTransformer2DModel(
             ]
         )
 
+        if use_2nd_guider:
+            self.transformer_blocks2 = nn.ModuleList(
+                [
+                    FluxTransformerBlock(
+                        dim=self.inner_dim,
+                        num_attention_heads=num_attention_heads,
+                        attention_head_dim=attention_head_dim,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+        else:
+           self.transformer_blocks2 = []
+           for i in range(len(self.transformer_blocks)):
+                self.transformer_blocks2.append(None)
+
+
         self.single_transformer_blocks = nn.ModuleList(
             [
                 FluxSingleTransformerBlock(
@@ -610,6 +628,24 @@ class FluxTransformer2DModel(
             ]
         )
 
+        if use_2nd_guider:
+
+            self.single_transformer_blocks2 = nn.ModuleList(
+                [
+                    FluxSingleTransformerBlock(
+                        dim=self.inner_dim,
+                        num_attention_heads=num_attention_heads,
+                        attention_head_dim=attention_head_dim,
+                    )
+                    for _ in range(num_single_layers)
+                ]
+            )
+        else:
+            self.single_transformer_blocks2 = []
+            for i in range(len(self.single_transformer_blocks)):
+                self.single_transformer_blocks2.append(None)
+
+
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
@@ -618,6 +654,7 @@ class FluxTransformer2DModel(
     def forward(
         self,
         hidden_states: torch.Tensor,
+        other_hidden_states: torch.Tensor = None,
         encoder_hidden_states: torch.Tensor = None,
         pooled_projections: torch.Tensor = None,
         timestep: torch.LongTensor = None,
@@ -672,6 +709,10 @@ class FluxTransformer2DModel(
                 )
 
         hidden_states = self.x_embedder(hidden_states)
+        
+        if other_hidden_states is not None:
+        # other states
+            other_hidden_states= self.x_embedder(other_hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -705,25 +746,48 @@ class FluxTransformer2DModel(
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for index_block, block in enumerate(self.transformer_blocks):
+
+        for index_block, (block, block2) in enumerate(zip(self.transformer_blocks, self.transformer_blocks2)):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                     block,
                     hidden_states,
+                    other_hidden_states if other_hidden_states is not None else None,
                     encoder_hidden_states,
                     temb,
                     image_rotary_emb,
                     joint_attention_kwargs,
                 )
+                if other_hidden_states is not None:
+                    encoder_hidden_states, other_hidden_states = self._gradient_checkpointing_func(
+                        block2,
+                        other_hidden_states,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        image_rotary_emb,
+                        joint_attention_kwargs,
+                    )
 
             else:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
+                    other_hidden_states=other_hidden_states if other_hidden_states is not None else None,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+
+                if other_hidden_states is not None:
+                    encoder_hidden_states, other_hidden_states = block2(
+                        hidden_states=other_hidden_states,
+                        other_hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
 
             # controlnet residual
             if controlnet_block_samples is not None:
@@ -737,8 +801,9 @@ class FluxTransformer2DModel(
                 else:
                     hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
 
-        for index_block, block in enumerate(self.single_transformer_blocks):
+        for index_block, (block, block2) in enumerate(zip(self.single_transformer_blocks, self.single_transformer_blocks2)):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
+
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                     block,
                     hidden_states,
@@ -748,15 +813,39 @@ class FluxTransformer2DModel(
                     joint_attention_kwargs,
                 )
 
+                if other_hidden_states is not None:
+
+                    encoder_hidden_states, other_hidden_states = self._gradient_checkpointing_func(
+                        block2,
+                        other_hidden_states,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        image_rotary_emb,
+                        joint_attention_kwargs,
+                    )
+
+
             else:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
+                    other_hidden_states=other_hidden_states if other_hidden_states is not None else None,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
 
+                if other_hidden_states is not None:
+                    encoder_hidden_states, other_hidden_states = block2(
+                        hidden_states=other_hidden_states,
+                        other_hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
+                    
             # controlnet residual
             if controlnet_single_block_samples is not None:
                 interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
@@ -766,11 +855,44 @@ class FluxTransformer2DModel(
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
+        if other_hidden_states is not None:
+            other_hidden_states = self.norm_out(other_hidden_states, temb)
+            other_output = self.proj_out(other_hidden_states)
+
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
 
-        if not return_dict:
-            return (output,)
+        if other_hidden_states is not None:
+            if not return_dict:
+                return (output, other_output)
 
-        return Transformer2DModelOutput(sample=output)
+            return Transformer2DModelOutput(sample=(output, other_output))
+        else:
+            if not return_dict:
+                return (output,)
+
+            return Transformer2DModelOutput(sample=(output,))
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, use_2nd_guider,  *model_args, **kwargs):
+        # Step A: load model normally
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+
+        # Step B: copy weights into the new transformer_blocks2
+        if use_2nd_guider:
+            if hasattr(model, "transformer_blocks2"):
+                with torch.no_grad():
+                    for b2, b1 in zip(model.transformer_blocks2, model.transformer_blocks):
+                        for (_, p2), (_, p1) in zip(b2.named_parameters(), b1.named_parameters()):
+                            p2.copy_(p1)
+                print("double_block weights loaded Yayy !!!!")
+            
+            if hasattr(model, "single_transformer_blocks2"):
+                with torch.no_grad():
+                    for b2, b1 in zip(model.single_transformer_blocks2, model.single_transformer_blocks):
+                        for (_, p2), (_, p1) in zip(b2.named_parameters(), b1.named_parameters()):
+                            p2.copy_(p1)             
+                print("Single_block weights loaded Yayy !!!!")
+
+        return model
